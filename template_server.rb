@@ -10,7 +10,6 @@ require 'logger'      # Logs debug statements
 set :port, 3000
 set :bind, '0.0.0.0'
 
-
 # This is template code to create a GitHub App server.
 # You can read more about GitHub Apps here: # https://developer.github.com/apps/
 #
@@ -29,7 +28,6 @@ set :bind, '0.0.0.0'
 #
 
 class GHAapp < Sinatra::Application
-
   # Expects that the private key in PEM format. Converts the newlines
   PRIVATE_KEY = OpenSSL::PKey::RSA.new(ENV['GITHUB_PRIVATE_KEY'].gsub('\n', "\n"))
 
@@ -45,7 +43,6 @@ class GHAapp < Sinatra::Application
     set :logging, Logger::DEBUG
   end
 
-
   # Before each request to the `/event_handler` route
   before '/event_handler' do
     get_payload_request(request)
@@ -55,19 +52,36 @@ class GHAapp < Sinatra::Application
     authenticate_installation(@payload)
   end
 
-
   post '/event_handler' do
+    case request.env['HTTP_X_GITHUB_EVENT']
+    when 'pull_request'
+      reviewer = {} # to-do: test multiple reviewers
+      pr_link = ''
+      task_links = []
 
-    # # # # # # # # # # # #
-    # ADD YOUR CODE HERE  #
-    # # # # # # # # # # # #
+      if @payload['action'] == 'review_requested'
+        pr_link = @payload['pull_request']['url']
+        body_content = @payload['pull_request']['body']
+        task_links = body_content.split.select { |word| word.include?('app.asana.com') } unless body_content.nil?
+        reviewer = @payload['requested_reviewer']
+      end
+
+      if @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
+        pr_link = @payload['pull_request']['url']
+        # to-do: check if the asana task is already in code review; if so, do nothing
+
+        body_content = @payload['pull_request']['body']
+        task_links = body_content.split.select { |word| word.include?('app.asana.com') } unless body_content.nil?
+      end
+
+      p pr_link
+      p task_links
+    end
 
     200 # success status
   end
 
-
   helpers do
-
     # # # # # # # # # # # # # # # # #
     # ADD YOUR HELPER METHODS HERE  #
     # # # # # # # # # # # # # # # # #
@@ -81,8 +95,8 @@ class GHAapp < Sinatra::Application
       @payload_raw = request.body.read
       begin
         @payload = JSON.parse @payload_raw
-      rescue => e
-        fail  "Invalid JSON (#{e}): #{@payload_raw}"
+      rescue StandardError => e
+        raise "Invalid JSON (#{e}): #{@payload_raw}"
       end
     end
 
@@ -93,14 +107,14 @@ class GHAapp < Sinatra::Application
     # a malicious third party.
     def authenticate_app
       payload = {
-          # The time that this JWT was issued, _i.e._ now.
-          iat: Time.now.to_i,
+        # The time that this JWT was issued, _i.e._ now.
+        iat: Time.now.to_i,
 
-          # JWT expiration time (10 minute maximum)
-          exp: Time.now.to_i + (10 * 60),
+        # JWT expiration time (10 minute maximum)
+        exp: Time.now.to_i + (10 * 60),
 
-          # Your GitHub App's identifier number
-          iss: APP_IDENTIFIER
+        # Your GitHub App's identifier number
+        iss: APP_IDENTIFIER
       }
 
       # Cryptographically sign the JWT.
@@ -140,7 +154,6 @@ class GHAapp < Sinatra::Application
       logger.debug "---- received event #{request.env['HTTP_X_GITHUB_EVENT']}"
       logger.debug "----    action #{@payload['action']}" unless @payload['action'].nil?
     end
-
   end
 
   # Finally some logic to let us run this server directly from the command line,

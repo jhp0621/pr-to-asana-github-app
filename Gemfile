@@ -1,6 +1,11 @@
 source 'http://rubygems.org'
 
-gem 'sinatra', '~> 2.0'
+gem 'dotenv'
+gem 'http'
 gem 'jwt', '~> 2.1'
 gem 'octokit', '~> 4.0'
-gem 'dotenv'
+gem 'puma'
+gem 'reel'
+gem 'sinatra', '~> 2.0'
+gem 'thin'
+gem 'webrick'
