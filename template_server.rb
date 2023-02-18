@@ -6,6 +6,7 @@ require 'openssl'     # Verifies the webhook signature
 require 'jwt'         # Authenticates a GitHub App
 require 'time'        # Gets ISO 8601 representation of a Time object
 require 'logger'      # Logs debug statements
+require 'asana'
 
 set :port, 3000
 set :bind, '0.0.0.0'
@@ -38,6 +39,8 @@ class GHAapp < Sinatra::Application
   # The GitHub App's identifier (type integer) set when registering an app.
   APP_IDENTIFIER = ENV['GITHUB_APP_IDENTIFIER']
 
+  ASANA_ACCESS_TOKEN = ENV['ASANA_PERSONAL_ACCSES_TOKEN']
+
   # Turn on Sinatra's verbose logging during development
   configure :development do
     set :logging, Logger::DEBUG
@@ -50,34 +53,50 @@ class GHAapp < Sinatra::Application
     authenticate_app
     # Authenticate the app installation in order to run API operations
     authenticate_installation(@payload)
+    authenticate_asana_app
   end
 
   post '/event_handler' do
     case request.env['HTTP_X_GITHUB_EVENT']
     when 'pull_request'
-      reviewer = {} # to-do: test multiple reviewers
+      reviewers = [] # to-do: test multiple reviewers
       pr_link = ''
       task_links = []
 
-      if @payload['action'] == 'review_requested'
+      if @payload['action'] == 'review_requested' || @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
         pr_link = @payload['pull_request']['url']
         body_content = @payload['pull_request']['body']
-        task_links = body_content.split.select { |word| word.include?('app.asana.com') } unless body_content.nil?
-        reviewer = @payload['requested_reviewer']
+        reviewers = @payload['pull_request']['requested_reviewers']
+
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            status_field = task.custom_fields.find { |field| field['name'].downcase.include? 'status' }
+            code_review_option = status_field['enum_options'].find do |option|
+              option['name'].downcase.include? 'code review'
+            end
+            current_status_option = status_field['enum_value']
+            if current_status_option['gid'] == code_review_option['gid']
+              next
+            end # if it's already in code review, skip next step
+
+            @asana_client.tasks.update_task(task_gid: task_id,
+                                            custom_fields: { status_field['gid'] => code_review_option['gid'] }) # update task status
+
+            # rescue puts "no task found"
+          end
+
+        end
       end
 
-      if @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
-        pr_link = @payload['pull_request']['url']
-        # to-do: check if the asana task is already in code review; if so, do nothing
-
-        body_content = @payload['pull_request']['body']
-        task_links = body_content.split.select { |word| word.include?('app.asana.com') } unless body_content.nil?
-      end
-
-      p pr_link
-      p task_links
     end
-
     200 # success status
   end
 
@@ -153,6 +172,12 @@ class GHAapp < Sinatra::Application
       # The action value indicates the which action triggered the event.
       logger.debug "---- received event #{request.env['HTTP_X_GITHUB_EVENT']}"
       logger.debug "----    action #{@payload['action']}" unless @payload['action'].nil?
+    end
+
+    def authenticate_asana_app
+      @asana_client = Asana::Client.new do |c|
+        c.authentication :access_token, ASANA_ACCESS_TOKEN
+      end
     end
   end
 

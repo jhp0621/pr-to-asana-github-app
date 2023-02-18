@@ -1,5 +1,6 @@
 source 'http://rubygems.org'
 
+gem 'asana'
 gem 'dotenv'
 gem 'http'
 gem 'jwt', '~> 2.1'
