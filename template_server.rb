@@ -7,6 +7,7 @@ require 'jwt'         # Authenticates a GitHub App
 require 'time'        # Gets ISO 8601 representation of a Time object
 require 'logger'      # Logs debug statements
 require 'asana'
+require 'date'
 
 set :port, 3000
 set :bind, '0.0.0.0'
@@ -64,7 +65,7 @@ class GHAapp < Sinatra::Application
       task_links = []
 
       if @payload['action'] == 'review_requested' || @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
-        pr_link = @payload['pull_request']['url']
+        pr_link = @payload['pull_request']['html_url']
         body_content = @payload['pull_request']['body']
         reviewers = @payload['pull_request']['requested_reviewers']
 
@@ -89,7 +90,9 @@ class GHAapp < Sinatra::Application
 
             @asana_client.tasks.update_task(task_gid: task_id,
                                             custom_fields: { status_field['gid'] => code_review_option['gid'] }) # update task status
-
+            # subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+            @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: 'Code Review',
+                                                        due_on: (Date.today + 3).to_s, notes: 'PR', html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
             # rescue puts "no task found"
           end
 
