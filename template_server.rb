@@ -57,12 +57,14 @@ class GHAapp < Sinatra::Application
     authenticate_asana_app
   end
 
+  asana_project_members = []
+
   post '/event_handler' do
     case request.env['HTTP_X_GITHUB_EVENT']
     when 'pull_request'
-      reviewers = [] # to-do: test multiple reviewers
+      reviewers = []
       pr_link = ''
-      task_links = []
+      task_id = ''
 
       if @payload['action'] == 'review_requested' || @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
         pr_link = @payload['pull_request']['html_url']
@@ -79,24 +81,58 @@ class GHAapp < Sinatra::Application
             task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
             next unless task
 
-            status_field = task.custom_fields.find { |field| field['name'].downcase.include? 'status' }
-            code_review_option = status_field['enum_options'].find do |option|
-              option['name'].downcase.include? 'code review'
+            if asana_project_members.empty?
+              project = @asana_client.projects.get_project(project_gid: project_id, options: { fields: ['members'] })
+              asana_project_members = project.members.map do |member|
+                @asana_client.users.get_user(user_gid: member['gid'], options: { fields: %w[email name] })
+              end
             end
+
+            status_field = task.custom_fields.find { |field| field['name'].downcase.include? 'status' }
+
+            code_review_option = status_field['enum_options'].find do |option|
+              option['name'].downcase.include?('code review') || option['name'].downcase.include?('pr review')
+            end
+
             current_status_option = status_field['enum_value']
-            if current_status_option['gid'] == code_review_option['gid']
-              next
-            end # if it's already in code review, skip next step
+
+            # if it's already in code review, skip next step
+            next if current_status_option && current_status_option['gid'] == code_review_option['gid']
 
             @asana_client.tasks.update_task(task_gid: task_id,
                                             custom_fields: { status_field['gid'] => code_review_option['gid'] }) # update task status
-            # subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
-            @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: 'Code Review',
-                                                        due_on: (Date.today + 3).to_s, notes: 'PR', html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
             # rescue puts "no task found"
           end
-
         end
+
+        unless reviewers.empty? || asana_project_members.empty?
+          reviewers.each do |reviewer|
+            login = reviewer['login']
+            github_user = @installation_client.user login # retrieve reviewer's github info (namely, name and email)
+            # p github_user
+            # identify the reviewer's asana account via email/name
+            asana_user = asana_project_members.find do |member|
+              member.email == github_user[:email] || member.name == github_user[:name]
+            end
+
+            subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+            code_review_subtask = subtasks.find { |task| task.name == "Code Review for #{login}" }
+            # if there already is a code review subtask for the reviewer, don't create another
+            next if code_review_subtask
+
+            if asana_user
+              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
+                                                          assignee: asana_user.gid,
+                                                          due_on: (Date.today + 3).to_s, notes: 'PR',
+                                                          html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
+            else
+              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
+                                                          due_on: (Date.today + 3).to_s, notes: "PR assigned to #{login}",
+                                                          html_notes: "<body><a href='#{pr_link}'>PR</a> assigned to <a href='#{reviewer['html_url']}'>#{login}</a></body>")
+            end
+          end
+        end
+
       end
 
     end
