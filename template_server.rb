@@ -64,9 +64,8 @@ class GHAapp < Sinatra::Application
     when 'pull_request'
       reviewers = []
       pr_link = ''
-      task_id = ''
 
-      if @payload['action'] == 'review_requested' || @payload['action'] == 'edited' # It is possible the PR description gets added after requesting review
+      if @payload['action'] == 'review_requested' || @payload['action'] == 'edited' || @payload['action'] == 'ready_for_review'
         pr_link = @payload['pull_request']['html_url']
         body_content = @payload['pull_request']['body']
         reviewers = @payload['pull_request']['requested_reviewers']
@@ -88,6 +87,8 @@ class GHAapp < Sinatra::Application
               end
             end
 
+            next if @payload['pull_request']['draft'] # skip updating asana task if the PR is in draft
+
             status_field = task.custom_fields.find { |field| field['name'].downcase.include? 'status' }
 
             code_review_option = status_field['enum_options'].find do |option|
@@ -96,46 +97,100 @@ class GHAapp < Sinatra::Application
 
             current_status_option = status_field['enum_value']
 
-            # if it's already in code review, skip next step
-            next if current_status_option && current_status_option['gid'] == code_review_option['gid']
-
-            @asana_client.tasks.update_task(task_gid: task_id,
-                                            custom_fields: { status_field['gid'] => code_review_option['gid'] }) # update task status
+            # if it's already in code review, skip updating status
+            if current_status_option && current_status_option['gid'] != code_review_option['gid']
+              @asana_client.tasks.update_task(task_gid: task_id,
+                                              custom_fields: { status_field['gid'] => code_review_option['gid'] })
+              @asana_client.stories.create_story_for_task(task_gid: task_id, text: "PR created: #{pr_link}")
+            end
             # rescue puts "no task found"
+
+            next if reviewers.empty? || asana_project_members.empty?
+
+            reviewers.each do |reviewer|
+              login = reviewer['login']
+              github_user = @installation_client.user login # retrieve reviewer's github info (namely, name and email)
+              # p github_user
+              # identify the reviewer's asana account via email/name
+              asana_user = asana_project_members.find do |member|
+                member.email == github_user[:email] || member.name == github_user[:name]
+              end
+
+              subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+              code_review_subtask = subtasks.find { |subtask| subtask.name == "Code Review for #{login}" }
+              # if there already is a code review subtask for the reviewer, re-open it if closed
+              if code_review_subtask
+                code_review_task = @asana_client.tasks.get_task(task_gid: code_review_subtask.gid)
+                if code_review_task.completed
+                  @asana_client.tasks.update_task(task_gid: code_review_subtask.gid, completed: false)
+                end
+                # create a subtask for code review if there isn't one
+              elsif asana_user
+
+                @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
+                                                            assignee: asana_user.gid,
+                                                            due_on: (Date.today + 3).to_s, notes: 'PR',
+                                                            html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
+              else
+                @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
+                                                            due_on: (Date.today + 3).to_s, notes: "PR assigned to #{login}",
+                                                            html_notes: "<body><a href='#{pr_link}'>PR</a> assigned to <a href='#{reviewer['html_url']}'>#{login}</a></body>")
+              end
+            end
           end
+
         end
 
-        unless reviewers.empty? || asana_project_members.empty?
-          reviewers.each do |reviewer|
-            login = reviewer['login']
-            github_user = @installation_client.user login # retrieve reviewer's github info (namely, name and email)
-            # p github_user
-            # identify the reviewer's asana account via email/name
-            asana_user = asana_project_members.find do |member|
-              member.email == github_user[:email] || member.name == github_user[:name]
+      end
+
+    when 'pull_request_review'
+      if @payload['action'] == 'submitted'
+        login = @payload['review']['user']['login']
+        github_reviewer = @installation_client.user login
+        asana_user = asana_project_members.find do |member|
+          member.email == github_reviewer[:email] || member.name == github_reviewer[:name]
+        end
+
+        pr_link = @payload['pull_request']['html_url']
+        body_content = @payload['pull_request']['body']
+
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            if asana_user
+              if @payload['review']['state'] == 'changes_requested'
+                @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                            text: "[Code Review] Changes requested from #{asana_user.name}")
+              elsif @payload['review']['state'] == 'commented'
+                @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                            text: "[Code Review] Comments provided by #{asana_user.name}")
+              end
+            elsif @payload['review']['state'] == 'changes_requested'
+              @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                          text: "[Code Review] Changes requested from #{login}")
+            elsif @payload['review']['state'] == 'commented'
+              @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                          text: "[Code Review] Comments provided by #{login}")
             end
 
             subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
-            code_review_subtask = subtasks.find { |task| task.name == "Code Review for #{login}" }
-            # if there already is a code review subtask for the reviewer, don't create another
-            next if code_review_subtask
-
-            if asana_user
-              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
-                                                          assignee: asana_user.gid,
-                                                          due_on: (Date.today + 3).to_s, notes: 'PR',
-                                                          html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
-            else
-              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Code Review for #{login}",
-                                                          due_on: (Date.today + 3).to_s, notes: "PR assigned to #{login}",
-                                                          html_notes: "<body><a href='#{pr_link}'>PR</a> assigned to <a href='#{reviewer['html_url']}'>#{login}</a></body>")
-            end
+            code_review_subtask = subtasks.find { |subtask| subtask.name == "Code Review for #{login}" }
+            @asana_client.tasks.update_task(task_gid: code_review_subtask.gid, completed: true) if code_review_subtask
           end
+
         end
 
       end
 
     end
+
     200 # success status
   end
 
