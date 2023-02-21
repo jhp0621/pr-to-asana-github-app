@@ -58,6 +58,8 @@ class GHAapp < Sinatra::Application
   end
 
   asana_project_members = []
+  code_review_index = ''
+  status_field_id = ''
 
   post '/event_handler' do
     case request.env['HTTP_X_GITHUB_EVENT']
@@ -78,6 +80,7 @@ class GHAapp < Sinatra::Application
             project_id = link.split('/')[zero_index + 1]
             task_id = link.split('/')[zero_index + 2]
             task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+
             next unless task
 
             if asana_project_members.empty?
@@ -90,17 +93,17 @@ class GHAapp < Sinatra::Application
             next if @payload['pull_request']['draft'] # skip updating asana task if the PR is in draft
 
             status_field = task.custom_fields.find { |field| field['name'].downcase.include? 'status' }
-
+            status_field_id = status_field['gid']
             code_review_option = status_field['enum_options'].find do |option|
               option['name'].downcase.include?('code review') || option['name'].downcase.include?('pr review')
             end
-
+            code_review_index = status_field['enum_options'].index code_review_option
             current_status_option = status_field['enum_value']
 
             # if it's already in code review, skip updating status
-            if current_status_option && current_status_option['gid'] != code_review_option['gid']
+            if current_status_option.nil? || (current_status_option['gid'] != code_review_option['gid'])
               @asana_client.tasks.update_task(task_gid: task_id,
-                                              custom_fields: { status_field['gid'] => code_review_option['gid'] })
+                                              custom_fields: { status_field_id => code_review_option['gid'] })
               @asana_client.stories.create_story_for_task(task_gid: task_id, text: "PR created: #{pr_link}")
             end
             # rescue puts "no task found"
@@ -143,8 +146,54 @@ class GHAapp < Sinatra::Application
 
       end
 
+      if @payload['action'] == 'review_request_removed'
+        pr_link = @payload['pull_request']['html_url']
+        body_content = @payload['pull_request']['body']
+        login = @payload['requested_reviewer']['login']
+        github_reviewer = @installation_client.user login
+
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+            code_review_task = subtasks.find { |subtask| subtask.name === "Code Review for #{login}" }
+            @asana_client.tasks.delete_task(task_gid: code_review_task.gid) if code_review_task
+          end
+
+        end
+      end
+
+      if @payload['action'] == 'closed' && (@payload['pull_request']['merged'])
+        pr_link = @payload['pull_request']['html_url']
+        body_content = @payload['pull_request']['body']
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            @asana_client.tasks.update_task(task_gid: task_id,
+                                            # update the status to the one that succeeds code review
+                                            custom_fields: { status_field_id => status_field['enum_options'][code_review_index + 1]['gid'] })
+          end
+
+        end
+      end
+
     when 'pull_request_review'
       if @payload['action'] == 'submitted'
+        state = @payload['review']['state']
         login = @payload['review']['user']['login']
         github_reviewer = @installation_client.user login
         asana_user = asana_project_members.find do |member|
@@ -165,19 +214,25 @@ class GHAapp < Sinatra::Application
             next unless task
 
             if asana_user
-              if @payload['review']['state'] == 'changes_requested'
+              if state == 'changes_requested'
                 @asana_client.stories.create_story_for_task(task_gid: task_id,
                                                             text: "[Code Review] Changes requested from #{asana_user.name}")
-              elsif @payload['review']['state'] == 'commented'
+              elsif state == 'commented'
                 @asana_client.stories.create_story_for_task(task_gid: task_id,
                                                             text: "[Code Review] Comments provided by #{asana_user.name}")
+              elsif state == 'approved'
+                @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                            text: "[Code Review] PR approved by #{asana_user.name}")
               end
-            elsif @payload['review']['state'] == 'changes_requested'
+            elsif state == 'changes_requested'
               @asana_client.stories.create_story_for_task(task_gid: task_id,
                                                           text: "[Code Review] Changes requested from #{login}")
-            elsif @payload['review']['state'] == 'commented'
+            elsif state == 'commented'
               @asana_client.stories.create_story_for_task(task_gid: task_id,
                                                           text: "[Code Review] Comments provided by #{login}")
+            elsif state == 'approved'
+              @asana_client.stories.create_story_for_task(task_gid: task_id,
+                                                          text: "[Code Review] PR approved by #{login}")
             end
 
             subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
