@@ -113,7 +113,7 @@ class GHAapp < Sinatra::Application
             reviewers.each do |reviewer|
               login = reviewer['login']
               github_user = @installation_client.user login # retrieve reviewer's github info (namely, name and email)
-              # p github_user
+
               # identify the reviewer's asana account via email/name
               asana_user = asana_project_members.find do |member|
                 member.email == github_user[:email] || member.name == github_user[:name]
@@ -150,7 +150,6 @@ class GHAapp < Sinatra::Application
         pr_link = @payload['pull_request']['html_url']
         body_content = @payload['pull_request']['body']
         login = @payload['requested_reviewer']['login']
-        github_reviewer = @installation_client.user login
 
         unless body_content.nil?
           task_links = body_content.split.select { |word| word.include?('app.asana.com') }
@@ -163,7 +162,7 @@ class GHAapp < Sinatra::Application
             next unless task
 
             subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
-            code_review_task = subtasks.find { |subtask| subtask.name === "Code Review for #{login}" }
+            code_review_task = subtasks.find { |subtask| subtask.name == "Code Review for #{login}" }
             @asana_client.tasks.delete_task(task_gid: code_review_task.gid) if code_review_task
           end
 
@@ -191,14 +190,100 @@ class GHAapp < Sinatra::Application
         end
       end
 
+      if @payload['action'] == 'assigned'
+        pr_link = @payload['pull_request']['html_url']
+        body_content = @payload['pull_request']['body']
+        login = @payload['assignee']['login']
+        github_user = @installation_client.user login
+
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            if asana_project_members.empty?
+              project = @asana_client.projects.get_project(project_gid: project_id,
+                                                           options: { fields: ['members'] })
+              asana_project_members = project.members.map do |member|
+                @asana_client.users.get_user(user_gid: member['gid'], options: { fields: %w[email name] })
+              end
+            end
+
+            next if @payload['pull_request']['draft'] # skip updating asana task if the PR is in draft
+
+            # identify the assginee's asana account via email/name
+            asana_user = asana_project_members.find do |member|
+              member.email == github_user[:email] || member.name == github_user[:name]
+            end
+
+            subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+            assigned_subtask = subtasks.find { |subtask| subtask.name == "Assigned to #{login}" }
+
+            if assigned_subtask
+              assigned_task = @asana_client.tasks.get_task(task_gid: assigned_subtask.gid)
+              @asana_client.tasks.update_task(task_gid: assigned_task.gid, completed: false) if assigned_task.completed
+            elsif asana_user
+              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Assigned to #{login}",
+                                                          assignee: asana_user.gid,
+                                                          due_on: (Date.today + 3).to_s, notes: 'PR',
+                                                          html_notes: "<body><a href='#{pr_link}'>PR</a></body>")
+            else
+              @asana_client.tasks.create_subtask_for_task(task_gid: task_id, name: "Assigned to #{login}",
+                                                          due_on: (Date.today + 3).to_s, notes: "PR assigned to #{login}",
+                                                          html_notes: "<body><a href='#{pr_link}'>PR</a> assigned to <a href='#{@payload['assignee']['html_url']}'>#{login}</a></body>")
+            end
+          end
+
+        end
+      end
+
+      if @payload['action'] == 'unassigned' # when an assignee is removed, we can assume their work (e.g., QA or styling) is done and mark the subtask completed
+        pr_link = @payload['pull_request']['html_url']
+        body_content = @payload['pull_request']['body']
+        login = @payload['assignee']['login']
+        github_user = @installation_client.user login
+
+        unless body_content.nil?
+          task_links = body_content.split.select { |word| word.include?('app.asana.com') }
+          task_links.each do |link|
+            # asana url construction: https://app.asana.com/0/{projectId}/{taskId}
+            zero_index = link.split('/').index('0')
+            project_id = link.split('/')[zero_index + 1]
+            task_id = link.split('/')[zero_index + 2]
+            task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
+            next unless task
+
+            if asana_project_members.empty?
+              project = @asana_client.projects.get_project(project_gid: project_id,
+                                                           options: { fields: ['members'] })
+              asana_project_members = project.members.map do |member|
+                @asana_client.users.get_user(user_gid: member['gid'], options: { fields: %w[email name] })
+              end
+            end
+
+            # identify the assginee's asana account via email/name
+            asana_user = asana_project_members.find do |member|
+              member.email == github_user[:email] || member.name == github_user[:name]
+            end
+
+            subtasks = @asana_client.tasks.get_subtasks_for_task(task_gid: task_id)
+            assigned_subtask = subtasks.find { |subtask| subtask.name == "Assigned to #{login}" }
+            @asana_client.tasks.update_task(task_gid: assigned_subtask.gid, completed: true) if assigned_subtask
+          end
+
+        end
+      end
+
     when 'pull_request_review'
       if @payload['action'] == 'submitted'
         state = @payload['review']['state']
         login = @payload['review']['user']['login']
         github_reviewer = @installation_client.user login
-        asana_user = asana_project_members.find do |member|
-          member.email == github_reviewer[:email] || member.name == github_reviewer[:name]
-        end
 
         pr_link = @payload['pull_request']['html_url']
         body_content = @payload['pull_request']['body']
@@ -213,20 +298,35 @@ class GHAapp < Sinatra::Application
             task = @asana_client.tasks.get_task(task_gid: task_id) # identify asana task
             next unless task
 
+            if asana_project_members.empty?
+              project = @asana_client.projects.get_project(project_gid: project_id,
+                                                           options: { fields: ['members'] })
+              asana_project_members = project.members.map do |member|
+                @asana_client.users.get_user(user_gid: member['gid'], options: { fields: %w[email name] })
+              end
+            end
+
+            asana_user = asana_project_members.find do |member|
+              member.email == github_reviewer[:email] || member.name == github_reviewer[:name]
+            end
+
             if asana_user
               if state == 'changes_requested'
                 @asana_client.stories.create_story_for_task(task_gid: task_id,
-                                                            text: "[Code Review] Changes requested from #{asana_user.name}")
+                                                            html_text: "<body>[Code Review] Changes requested by <a data-asana-type='user' data-asana-gid='#{asana_user.gid}'>#{asana_user.name}</a></body>")
+
               elsif state == 'commented'
                 @asana_client.stories.create_story_for_task(task_gid: task_id,
-                                                            text: "[Code Review] Comments provided by #{asana_user.name}")
+                                                            html_text: "<body>[Code Review] Comments provided by <a data-asana-type='user' data-asana-gid='#{asana_user.gid}'>#{asana_user.name}</a></body>")
+
               elsif state == 'approved'
                 @asana_client.stories.create_story_for_task(task_gid: task_id,
-                                                            text: "[Code Review] PR approved by #{asana_user.name}")
+                                                            html_text: "<body>[Code Review] PR approved by <a data-asana-type='user' data-asana-gid='#{asana_user.gid}'>#{asana_user.name}</a></body>")
+
               end
             elsif state == 'changes_requested'
               @asana_client.stories.create_story_for_task(task_gid: task_id,
-                                                          text: "[Code Review] Changes requested from #{login}")
+                                                          text: "[Code Review] Changes requested by #{login}")
             elsif state == 'commented'
               @asana_client.stories.create_story_for_task(task_gid: task_id,
                                                           text: "[Code Review] Comments provided by #{login}")
