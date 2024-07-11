@@ -8,6 +8,7 @@ require 'time'        # Gets ISO 8601 representation of a Time object
 require 'logger'      # Logs debug statements
 require 'asana'
 require 'date'
+require 'pry'
 
 set :port, 3000
 set :bind, '0.0.0.0'
@@ -40,7 +41,7 @@ class GHAapp < Sinatra::Application
   # The GitHub App's identifier (type integer) set when registering an app.
   APP_IDENTIFIER = ENV['GITHUB_APP_IDENTIFIER']
 
-  ASANA_ACCESS_TOKEN = ENV['ASANA_PERSONAL_ACCSES_TOKEN']
+  ASANA_ACCESS_TOKEN = ENV['ASANA_PERSONAL_ACCESS_TOKEN']
 
   # Turn on Sinatra's verbose logging during development
   configure :development do
@@ -48,20 +49,22 @@ class GHAapp < Sinatra::Application
   end
 
   # Before each request to the `/event_handler` route
-  before '/event_handler' do
-    get_payload_request(request)
-    verify_webhook_signature
-    authenticate_app
-    # Authenticate the app installation in order to run API operations
-    authenticate_installation(@payload)
-    authenticate_asana_app
+  before '/' do
+    if request.env['HTTP_X_GITHUB_EVENT']
+      get_payload_request(request)
+      verify_webhook_signature
+      authenticate_app
+      # Authenticate the app installation in order to run API operations
+      authenticate_installation(@payload)
+      authenticate_asana_app
+    end
   end
 
   asana_project_members = []
   code_review_index = ''
   status_field_id = ''
-
-  post '/event_handler' do
+  
+  post '/' do
     case request.env['HTTP_X_GITHUB_EVENT']
     when 'pull_request'
       reviewers = []
